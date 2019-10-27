@@ -2,13 +2,16 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sirupsen/logrus"
@@ -26,6 +29,7 @@ type (
 		Secrets          map[string]string
 		InitOptions      InitOptions
 		FmtOptions       FmtOptions
+		Assertions       Assertions
 		Cacert           string
 		Sensitive        bool
 		RoleARN          string
@@ -58,11 +62,18 @@ type (
 		Check *bool `json:"check"`
 	}
 
+	// Assertions will check number of expected additions, changes and deletions after terraform plan
+	Assertions struct {
+		AdditionsExact int `json:"additions_exact"`
+		ChangesExact   int `json:"changes_exact"`
+		DeletionsExact int `json:"deletions_exact"`
+	}
+
 	// Plugin represents the plugin instance to be executed
 	Plugin struct {
-		Config    Config
-		Netrc     Netrc
-		Terraform Terraform
+		Config     Config
+		Netrc      Netrc
+		Terraform  Terraform
 	}
 )
 
@@ -139,22 +150,124 @@ func (p Plugin) Exec() error {
 		if p.Config.RootDir != "" {
 			c.Dir = c.Dir + "/" + p.Config.RootDir
 		}
-		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
 		if !p.Config.Sensitive {
 			trace(c)
 		}
 
-		err := c.Run()
+		// Directly pass strerr to standard
+		c.Stderr = os.Stderr
+
+		// Capture stdout to use for assertions
+		var stdout []byte
+		var errStdout error
+		stdoutIn, _ := c.StdoutPipe()
+
+		err := c.Start()
 		if err != nil {
 			logrus.WithFields(logrus.Fields{
 				"error": err,
 			}).Fatal("Failed to execute a command")
 		}
+
+		// cmd.Wait() should be called only after we finish reading
+		// from stdoutIn and stderrIn.
+		// wg ensures that we finish
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			stdout, errStdout = copyAndCapture(os.Stdout, stdoutIn)
+			wg.Done()
+		}()
+		wg.Wait()
+
+		err = c.Wait()
+		if err != nil {
+			logrus.WithFields(logrus.Fields{
+				"error": err,
+			}).Fatal("Failed to run a command")
+		}
+		if errStdout != nil {
+			logrus.WithFields(logrus.Fields{
+				"error": errStdout,
+			}).Fatal("Failed to capture stdout or stderr")
+		}
+
+		// Evaluate assertions only when running terraform plan
+		if c.Args[1] == "plan" {
+			p.evaluateAssertions(string(stdout))
+		}
+
 		logrus.Debug("Command completed successfully")
 	}
 
 	return nil
+}
+
+func (p Plugin) evaluateAssertions(planOutput string) {
+	var additions = 0
+	var changes = 0
+	var deletions = 0
+
+	updateToDateRe := regexp.MustCompile(`No changes\. Infrastructure is up-to-date\.`)
+	if !updateToDateRe.MatchString(planOutput) {
+		// Check if assertions are met based on "Plan: X to add, X to change, X to destroy." in output
+		planRe := regexp.MustCompile(`(?P<Additions>[0-9]+) to add, (?P<Changes>[0-9]+) to change, (?P<Deletions>[0-9]+) to destroy\.`)
+		matches := planRe.FindStringSubmatch(planOutput)
+		if len(matches) != 4 {
+			logrus.Fatal("Unexpected number of matches in terraform output when evaluating assertions")
+		}
+
+		additions, _ = strconv.Atoi(matches[1])
+		changes, _ = strconv.Atoi(matches[2])
+		deletions, _ = strconv.Atoi(matches[3])
+	}
+
+	if p.Config.Assertions.AdditionsExact > -1 {
+		if additions != p.Config.Assertions.AdditionsExact {
+			logrus.Fatal(fmt.Sprintf("FATAL: Expected %d additions but saw %d additions on terraform plan", p.Config.Assertions.AdditionsExact, additions))
+		} else {
+			fmt.Println(fmt.Sprintf("INFO: As expected saw %d additions on terraform plan.", additions))
+		}
+	}
+
+	if p.Config.Assertions.ChangesExact > -1 {
+		if changes != p.Config.Assertions.ChangesExact {
+			logrus.Fatal(fmt.Sprintf("FATAL: Expected %d changes but saw %d changes on terraform plan", p.Config.Assertions.ChangesExact, changes))
+		} else {
+			fmt.Println(fmt.Sprintf("INFO: As expected saw %d changes on terraform plan.", changes))
+		}
+	}
+
+	if p.Config.Assertions.DeletionsExact > -1 {
+		if deletions != p.Config.Assertions.DeletionsExact {
+			logrus.Fatal(fmt.Sprintf("FATAL: Expected %d deletions but saw %d deletions on terraform plan", p.Config.Assertions.DeletionsExact, deletions))
+		} else {
+			fmt.Println(fmt.Sprintf("INFO: As expected saw %d deletions on terraform plan.", deletions))
+		}
+	}
+}
+
+func copyAndCapture(w io.Writer, r io.Reader) ([]byte, error) {
+	var out []byte
+	buf := make([]byte, 1024, 1024)
+	for {
+		n, err := r.Read(buf[:])
+		if n > 0 {
+			d := buf[:n]
+			out = append(out, d...)
+			_, err := w.Write(d)
+			if err != nil {
+				return out, err
+			}
+		}
+		if err != nil {
+			// Read returns io.EOF at the end of file, which is not an error for us
+			if err == io.EOF {
+				err = nil
+			}
+			return out, err
+		}
+	}
 }
 
 // CopyTfEnv creates copies of TF_VAR_ to lowercase

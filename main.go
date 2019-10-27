@@ -48,6 +48,11 @@ func main() {
 			Usage:  "options for the fmt command. See https://www.terraform.io/docs/commands/fmt.html",
 			EnvVar: "PLUGIN_FMT_OPTIONS",
 		},
+		cli.StringFlag{
+			Name:   "assertions",
+			Usage:  "assertions to evaluate the plan against.",
+			EnvVar: "PLUGIN_ASSERTIONS",
+		},
 		cli.IntFlag{
 			Name:   "parallelism",
 			Usage:  "The number of concurrent operations as Terraform walks its graph",
@@ -146,6 +151,12 @@ func run(c *cli.Context) error {
 	json.Unmarshal([]byte(c.String("init_options")), &initOptions)
 	fmtOptions := FmtOptions{}
 	json.Unmarshal([]byte(c.String("fmt_options")), &fmtOptions)
+	assertions := Assertions{
+		AdditionsExact: -1,
+		ChangesExact: -1,
+		DeletionsExact: -1,
+	}
+	json.Unmarshal([]byte(c.String("assertions")), &assertions)
 
 	plugin := Plugin{
 		Config: Config{
@@ -154,6 +165,7 @@ func run(c *cli.Context) error {
 			Secrets:          secrets,
 			InitOptions:      initOptions,
 			FmtOptions:       fmtOptions,
+			Assertions:       assertions,
 			Cacert:           c.String("ca_cert"),
 			Sensitive:        c.Bool("sensitive"),
 			RoleARN:          c.String("role_arn_to_assume"),
